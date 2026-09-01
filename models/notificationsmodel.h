@@ -11,6 +11,8 @@
 #include <QAbstractListModel>
 #include <QList>
 #include <QPixmap>
+#include <QStringList>
+#include <QTimer>
 
 #include "dbusinterfaces.h"
 
@@ -35,7 +37,9 @@ public:
         IconPathModelRole,
         DbusInterfaceRole,
         TitleModelRole,
-        TextModelRole
+        TextModelRole,
+        ActionsModelRole,
+        ActiveModelRole
     };
 
     explicit NotificationsModel(QObject *parent = nullptr);
@@ -56,11 +60,9 @@ public Q_SLOTS:
     void dismissAll();
 
 private Q_SLOTS:
-    void notificationAdded(const QString &id);
-    void notificationRemoved(const QString &id);
     void notificationUpdated();
     void refreshNotificationList();
-    void receivedNotifications(QDBusPendingCallWatcher *watcher);
+    void resetDbusInterface();
     void clearNotifications();
 
 Q_SIGNALS:
@@ -69,9 +71,25 @@ Q_SIGNALS:
     void rowsChanged();
 
 private:
+    struct NotificationEntry {
+        QString internalId;
+        QString publicId;
+        QString appName;
+        QString ticker;
+        QString title;
+        QString text;
+        QStringList actions;
+        bool dismissable = false;
+        bool repliable = false;
+        bool active = false;
+        qint64 timestamp = 0;
+        NotificationDbusInterface *dbusInterface = nullptr;
+    };
+
     DeviceNotificationsDbusInterface *m_dbusInterface;
-    QList<NotificationDbusInterface *> m_notificationList;
+    QList<NotificationEntry> m_notificationList;
     QString m_deviceId;
+    QTimer m_refreshTimer;
 };
 
 #endif // DEVICESMODEL_H

@@ -35,6 +35,7 @@ class Notification : public QObject
     Q_PROPERTY(bool hasIcon READ hasIcon NOTIFY ready)
     Q_PROPERTY(bool silent READ silent NOTIFY ready)
     Q_PROPERTY(QString replyId READ replyId NOTIFY ready)
+    Q_PROPERTY(QStringList actions READ actions NOTIFY ready)
 
 public:
     Notification(const NetworkPacket &np, const Device *device, QObject *parent);
@@ -74,6 +75,10 @@ public:
     QString replyId() const
     {
         return m_requestReplyId;
+    }
+    QStringList actions() const
+    {
+        return m_actions;
     }
     bool hasIcon() const
     {

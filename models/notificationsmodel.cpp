@@ -8,6 +8,14 @@
 
 #include <QDebug>
 #include <QIcon>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonParseError>
+#include <QTimer>
+
+#include <algorithm>
+#include <utility>
 
 #include <dbushelper.h>
 
@@ -19,14 +27,26 @@ NotificationsModel::NotificationsModel(QObject *parent)
 {
     connect(this, &QAbstractItemModel::rowsInserted, this, &NotificationsModel::rowsChanged);
     connect(this, &QAbstractItemModel::rowsRemoved, this, &NotificationsModel::rowsChanged);
+    connect(this, &QAbstractItemModel::modelReset, this, &NotificationsModel::rowsChanged);
 
     connect(this, &QAbstractItemModel::dataChanged, this, &NotificationsModel::anyDismissableChanged);
     connect(this, &QAbstractItemModel::rowsInserted, this, &NotificationsModel::anyDismissableChanged);
+    connect(this, &QAbstractItemModel::modelReset, this, &NotificationsModel::anyDismissableChanged);
+
+    m_refreshTimer.setInterval(500);
+    m_refreshTimer.setSingleShot(true);
+    connect(&m_refreshTimer, &QTimer::timeout, this, [this] {
+        resetDbusInterface();
+        refreshNotificationList();
+    });
 
     QDBusServiceWatcher *watcher =
         new QDBusServiceWatcher(DaemonDbusInterface::activatedService(), QDBusConnection::sessionBus(), QDBusServiceWatcher::WatchForOwnerChange, this);
-    connect(watcher, &QDBusServiceWatcher::serviceRegistered, this, &NotificationsModel::refreshNotificationList);
-    connect(watcher, &QDBusServiceWatcher::serviceUnregistered, this, &NotificationsModel::clearNotifications);
+    connect(watcher, &QDBusServiceWatcher::serviceRegistered, &m_refreshTimer, qOverload<>(&QTimer::start));
+    connect(watcher, &QDBusServiceWatcher::serviceUnregistered, this, [this] {
+        m_refreshTimer.stop();
+        clearNotifications();
+    });
 }
 
 QHash<int, QByteArray> NotificationsModel::roleNames() const
@@ -41,6 +61,8 @@ QHash<int, QByteArray> NotificationsModel::roleNames() const
     names.insert(IconPathModelRole, "appIcon");
     names.insert(TitleModelRole, "title");
     names.insert(TextModelRole, "notitext");
+    names.insert(ActionsModelRole, "actions");
+    names.insert(ActiveModelRole, "active");
     return names;
 }
 
@@ -55,124 +77,138 @@ QString NotificationsModel::deviceId() const
 
 void NotificationsModel::setDeviceId(const QString &deviceId)
 {
+    m_refreshTimer.stop();
+    clearNotifications();
     m_deviceId = deviceId;
 
-    if (m_dbusInterface) {
-        delete m_dbusInterface;
-    }
-
-    m_dbusInterface = new DeviceNotificationsDbusInterface(deviceId, this);
-
-    connect(m_dbusInterface, &OrgKdeKdeconnectDeviceNotificationsInterface::notificationPosted, this, &NotificationsModel::notificationAdded);
-    connect(m_dbusInterface, &OrgKdeKdeconnectDeviceNotificationsInterface::notificationRemoved, this, &NotificationsModel::notificationRemoved);
-    connect(m_dbusInterface, &OrgKdeKdeconnectDeviceNotificationsInterface::allNotificationsRemoved, this, &NotificationsModel::clearNotifications);
-
+    resetDbusInterface();
     refreshNotificationList();
 
     Q_EMIT deviceIdChanged(deviceId);
 }
 
-void NotificationsModel::notificationAdded(const QString &id)
-{
-    beginInsertRows(QModelIndex(), 0, 0);
-    NotificationDbusInterface *dbusInterface = new NotificationDbusInterface(m_deviceId, id, this);
-    connect(dbusInterface, &NotificationDbusInterface::ready, this, &NotificationsModel::notificationUpdated);
-    m_notificationList.prepend(dbusInterface);
-    endInsertRows();
-}
-
-void NotificationsModel::notificationRemoved(const QString &id)
-{
-    for (int i = 0; i < m_notificationList.size(); ++i) {
-        if (m_notificationList[i]->notificationId() == id) {
-            beginRemoveRows(QModelIndex(), i, i);
-            m_notificationList.removeAt(i);
-            endRemoveRows();
-            return;
-        }
-    }
-    qCWarning(KDECONNECT_MODELS) << "Attempted to remove unknown notification: " << id;
-}
-
 void NotificationsModel::refreshNotificationList()
 {
-    if (!m_dbusInterface) {
+    if (!m_dbusInterface || !m_dbusInterface->isValid()) {
+        if (!m_deviceId.isEmpty()) {
+            m_refreshTimer.start();
+        }
         return;
     }
 
-    clearNotifications();
-
-    if (!m_dbusInterface->isValid()) {
-        qCWarning(KDECONNECT_MODELS) << "dbus interface not valid";
+    const QVariant historyProperty = m_dbusInterface->property("notificationHistory");
+    if (!historyProperty.isValid()) {
+        m_refreshTimer.start();
         return;
     }
 
-    QDBusPendingReply<QStringList> pendingNotificationIds = m_dbusInterface->activeNotifications();
-    QDBusPendingCallWatcher *watcher = new QDBusPendingCallWatcher(pendingNotificationIds, this);
+    m_refreshTimer.stop();
+    QList<NotificationEntry> notificationList;
+    const QByteArray history = historyProperty.toString().toUtf8().trimmed();
+    if (!history.isEmpty()) {
+        QJsonParseError error;
+        const QJsonDocument document = QJsonDocument::fromJson(history, &error);
+        if (error.error != QJsonParseError::NoError || !document.isArray()) {
+            qCWarning(KDECONNECT_MODELS) << "Invalid notification history JSON:" << error.errorString();
+        } else {
+            const QJsonArray notifications = document.array();
+            notificationList.reserve(notifications.size());
+            for (const QJsonValue &value : notifications) {
+                if (!value.isObject()) {
+                    continue;
+                }
 
-    QObject::connect(watcher, &QDBusPendingCallWatcher::finished, this, &NotificationsModel::receivedNotifications);
+                const QJsonObject notification = value.toObject();
+                NotificationEntry entry;
+                entry.internalId = notification.value(QStringLiteral("internalId")).toString();
+                entry.publicId = notification.value(QStringLiteral("publicId")).toString();
+                entry.appName = notification.value(QStringLiteral("appName")).toString();
+                entry.ticker = notification.value(QStringLiteral("ticker")).toString();
+                entry.title = notification.value(QStringLiteral("title")).toString();
+                entry.text = notification.value(QStringLiteral("text")).toString();
+                entry.dismissable = notification.value(QStringLiteral("dismissable")).toBool();
+                entry.repliable = notification.value(QStringLiteral("repliable")).toBool();
+                entry.active = notification.value(QStringLiteral("active")).toBool() && !entry.publicId.isEmpty();
+                entry.timestamp = notification.value(QStringLiteral("timestamp")).toVariant().toLongLong();
+
+                const QJsonArray actions = notification.value(QStringLiteral("actions")).toArray();
+                entry.actions.reserve(actions.size());
+                for (const QJsonValue &action : actions) {
+                    if (action.isString()) {
+                        entry.actions.append(action.toString());
+                    }
+                }
+                notificationList.append(entry);
+            }
+
+            std::stable_sort(notificationList.begin(), notificationList.end(), [](const NotificationEntry &left, const NotificationEntry &right) {
+                return left.timestamp > right.timestamp;
+            });
+        }
+    }
+
+    beginResetModel();
+    for (const NotificationEntry &entry : std::as_const(m_notificationList)) {
+        delete entry.dbusInterface;
+    }
+    m_notificationList = std::move(notificationList);
+    for (NotificationEntry &entry : m_notificationList) {
+        if (entry.active) {
+            entry.dbusInterface = new NotificationDbusInterface(m_deviceId, entry.publicId, this);
+            connect(entry.dbusInterface, &NotificationDbusInterface::ready, this, &NotificationsModel::notificationUpdated);
+        }
+    }
+    endResetModel();
 }
 
-void NotificationsModel::receivedNotifications(QDBusPendingCallWatcher *watcher)
+void NotificationsModel::resetDbusInterface()
 {
-    watcher->deleteLater();
-    clearNotifications();
-    QDBusPendingReply<QStringList> pendingNotificationIds = *watcher;
+    delete m_dbusInterface;
+    m_dbusInterface = nullptr;
 
-    if (pendingNotificationIds.isError()) {
-        qCWarning(KDECONNECT_MODELS) << pendingNotificationIds.error();
+    if (m_deviceId.isEmpty()) {
         return;
     }
 
-    const QStringList notificationIds = pendingNotificationIds.value();
-    if (notificationIds.isEmpty()) {
-        return;
-    }
-
-    beginInsertRows(QModelIndex(), 0, notificationIds.size() - 1);
-    for (const QString &notificationId : notificationIds) {
-        NotificationDbusInterface *dbusInterface = new NotificationDbusInterface(m_deviceId, notificationId, this);
-        m_notificationList.append(dbusInterface);
-    }
-    endInsertRows();
+    m_dbusInterface = new DeviceNotificationsDbusInterface(m_deviceId, this);
+    connect(m_dbusInterface, &DeviceNotificationsDbusInterface::notificationHistoryChanged, this, &NotificationsModel::refreshNotificationList);
 }
 
 QVariant NotificationsModel::data(const QModelIndex &index, int role) const
 {
-    if (!index.isValid() || index.row() < 0 || index.row() >= m_notificationList.count() || !m_notificationList[index.row()]->isValid()) {
+    if (!index.isValid() || index.row() < 0 || index.row() >= m_notificationList.count()) {
         return QVariant();
     }
 
-    if (!m_dbusInterface || !m_dbusInterface->isValid()) {
-        return QVariant();
-    }
+    const NotificationEntry &notification = m_notificationList[index.row()];
 
-    NotificationDbusInterface *notification = m_notificationList[index.row()];
-
-    // FIXME: This function gets called lots of times, producing lots of dbus calls. Add a cache?
     switch (role) {
     case IconModelRole:
         return QIcon::fromTheme(QStringLiteral("device-notifier"));
     case IdModelRole:
-        return notification->internalId();
+        return notification.internalId;
     case NameModelRole:
-        return notification->ticker();
+        return notification.ticker;
     case ContentModelRole:
         return QString(); // To implement in the Android side
     case AppNameModelRole:
-        return notification->appName();
+        return notification.appName;
     case DbusInterfaceRole:
-        return QVariant::fromValue<QObject *>(notification);
+        return QVariant::fromValue<QObject *>(notification.dbusInterface);
     case DismissableModelRole:
-        return notification->dismissable();
+        return notification.dismissable;
     case RepliableModelRole:
-        return !notification->replyId().isEmpty();
+        return notification.repliable;
     case IconPathModelRole:
-        return notification->iconPath();
+        return notification.dbusInterface && notification.dbusInterface->isValid() ? notification.dbusInterface->iconPath() : QString();
     case TitleModelRole:
-        return notification->title();
+        return notification.title;
     case TextModelRole:
-        return notification->text();
+        return notification.text;
+    case ActionsModelRole:
+        return notification.actions;
+    case ActiveModelRole:
+        return notification.active;
     default:
         return QVariant();
     }
@@ -189,7 +225,7 @@ NotificationDbusInterface *NotificationsModel::getNotification(const QModelIndex
         return nullptr;
     }
 
-    return m_notificationList[row];
+    return m_notificationList[row].dbusInterface;
 }
 
 int NotificationsModel::rowCount(const QModelIndex &parent) const
@@ -204,8 +240,8 @@ int NotificationsModel::rowCount(const QModelIndex &parent) const
 
 bool NotificationsModel::isAnyDimissable() const
 {
-    for (NotificationDbusInterface *notification : std::as_const(m_notificationList)) {
-        if (notification->dismissable()) {
+    for (const NotificationEntry &notification : m_notificationList) {
+        if (notification.active && notification.dismissable) {
             return true;
         }
     }
@@ -214,26 +250,36 @@ bool NotificationsModel::isAnyDimissable() const
 
 void NotificationsModel::dismissAll()
 {
-    for (NotificationDbusInterface *notification : std::as_const(m_notificationList)) {
-        if (notification->dismissable()) {
-            notification->dismiss();
+    for (const NotificationEntry &notification : m_notificationList) {
+        if (notification.active && notification.dismissable && notification.dbusInterface) {
+            notification.dbusInterface->dismiss();
         }
     }
 }
 
 void NotificationsModel::clearNotifications()
 {
-    if (!m_notificationList.isEmpty()) {
-        beginRemoveRows(QModelIndex(), 0, m_notificationList.size() - 1);
-        qDeleteAll(m_notificationList);
-        m_notificationList.clear();
-        endRemoveRows();
+    if (m_notificationList.isEmpty()) {
+        return;
     }
+
+    beginResetModel();
+    for (const NotificationEntry &entry : std::as_const(m_notificationList)) {
+        delete entry.dbusInterface;
+    }
+    m_notificationList.clear();
+    endResetModel();
 }
 
 void NotificationsModel::notificationUpdated()
 {
-    Q_EMIT dataChanged(index(0, 0), index(m_notificationList.size() - 1, 0));
+    NotificationDbusInterface *notification = qobject_cast<NotificationDbusInterface *>(sender());
+    for (int row = 0; row < m_notificationList.size(); ++row) {
+        if (m_notificationList[row].dbusInterface == notification) {
+            Q_EMIT dataChanged(index(row, 0), index(row, 0), {IconPathModelRole});
+            return;
+        }
+    }
 }
 
 #include "moc_notificationsmodel.cpp"

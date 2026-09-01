@@ -20,9 +20,29 @@
 #include <private/qtx11extras_p.h>
 #endif
 
+#include <QDateTime>
+#include <QJsonDocument>
+#include <QJsonParseError>
 #include <QMimeData>
+#include <QSet>
 
 K_PLUGIN_CLASS_WITH_JSON(NotificationsPlugin, "kdeconnect_notifications.json")
+
+namespace
+{
+constexpr qsizetype maximumNotificationHistorySize = 100;
+}
+
+NotificationsPlugin::NotificationsPlugin(QObject *parent, const QVariantList &args)
+    : KdeConnectPlugin(parent, args)
+{
+    loadNotificationHistory();
+}
+
+NotificationsPlugin::~NotificationsPlugin()
+{
+    markAllNotificationHistoryInactive();
+}
 
 void NotificationsPlugin::connected()
 {
@@ -61,6 +81,7 @@ void NotificationsPlugin::receivePacket(const NetworkPacket &np)
         QString pubId = m_internalIdToPublicId.value(id);
         noti = m_notifications.value(pubId);
         noti->update(np);
+        upsertNotificationHistory(noti, pubId);
     }
 }
 
@@ -111,12 +132,15 @@ void NotificationsPlugin::addNotification(Notification *noti)
     QDBusConnection::sessionBus().registerObject(device()->dbusPath() + QStringLiteral("/notifications/") + publicId,
                                                  noti,
                                                  QDBusConnection::ExportScriptableContents);
+    upsertNotificationHistory(noti, publicId);
     Q_EMIT notificationPosted(publicId);
 }
 
 void NotificationsPlugin::removeNotification(const QString &internalId)
 {
     // qCDebug(KDECONNECT_PLUGIN_NOTIFICATIONS) << "removeNotification" << internalId;
+
+    markNotificationHistoryInactive(internalId);
 
     if (!m_internalIdToPublicId.contains(internalId)) {
         qCDebug(KDECONNECT_PLUGIN_NOTIFICATIONS) << "Not found noti by internal Id: " << internalId;
@@ -212,6 +236,144 @@ void NotificationsPlugin::copyAuthCodeIfPresent(const QString &action)
 QString NotificationsPlugin::newId()
 {
     return QString::number(++m_lastId);
+}
+
+QString NotificationsPlugin::notificationHistory() const
+{
+    return QString::fromUtf8(m_persistedNotificationHistory);
+}
+
+void NotificationsPlugin::loadNotificationHistory()
+{
+    const QByteArray storedHistory = config()->getByteArray(QStringLiteral("history"), QByteArrayLiteral("[]"));
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(storedHistory, &parseError);
+    QSet<QString> internalIds;
+
+    if (parseError.error == QJsonParseError::NoError && document.isArray()) {
+        const QJsonArray storedArray = document.array();
+        for (const QJsonValue &value : storedArray) {
+            if (!value.isObject() || m_notificationHistory.size() >= maximumNotificationHistorySize) {
+                continue;
+            }
+
+            const QJsonObject storedNotification = value.toObject();
+            const QString internalId = storedNotification.value(QStringLiteral("internalId")).toString();
+            if (internalId.isEmpty() || internalIds.contains(internalId)) {
+                continue;
+            }
+
+            QJsonArray actions;
+            const QJsonArray storedActions = storedNotification.value(QStringLiteral("actions")).toArray();
+            for (const QJsonValue &action : storedActions) {
+                if (action.isString()) {
+                    actions.append(action.toString());
+                }
+            }
+
+            QJsonObject notification{
+                {QStringLiteral("actions"), actions},
+                {QStringLiteral("internalId"), internalId},
+                {QStringLiteral("publicId"), QString()},
+                {QStringLiteral("appName"), storedNotification.value(QStringLiteral("appName")).toString()},
+                {QStringLiteral("ticker"), storedNotification.value(QStringLiteral("ticker")).toString()},
+                {QStringLiteral("title"), storedNotification.value(QStringLiteral("title")).toString()},
+                {QStringLiteral("text"), storedNotification.value(QStringLiteral("text")).toString()},
+                {QStringLiteral("dismissable"), storedNotification.value(QStringLiteral("dismissable")).toBool()},
+                {QStringLiteral("repliable"), storedNotification.value(QStringLiteral("repliable")).toBool()},
+                {QStringLiteral("active"), false},
+                {QStringLiteral("timestamp"), storedNotification.value(QStringLiteral("timestamp")).toDouble()},
+            };
+            m_notificationHistory.append(notification);
+            internalIds.insert(internalId);
+        }
+    }
+
+    m_persistedNotificationHistory = QJsonDocument(m_notificationHistory).toJson(QJsonDocument::Compact);
+    if (m_persistedNotificationHistory != storedHistory) {
+        config()->set(QStringLiteral("history"), m_persistedNotificationHistory);
+        Q_EMIT notificationHistoryChanged();
+    }
+}
+
+void NotificationsPlugin::persistNotificationHistory()
+{
+    const QByteArray history = QJsonDocument(m_notificationHistory).toJson(QJsonDocument::Compact);
+    if (history == m_persistedNotificationHistory) {
+        return;
+    }
+
+    m_persistedNotificationHistory = history;
+    config()->set(QStringLiteral("history"), history);
+    Q_EMIT notificationHistoryChanged();
+}
+
+void NotificationsPlugin::upsertNotificationHistory(Notification *noti, const QString &publicId)
+{
+    const QString internalId = noti->internalId();
+    for (qsizetype i = m_notificationHistory.size() - 1; i >= 0; --i) {
+        if (m_notificationHistory.at(i).toObject().value(QStringLiteral("internalId")).toString() == internalId) {
+            m_notificationHistory.removeAt(i);
+        }
+    }
+
+    QJsonObject notification{
+        {QStringLiteral("actions"), QJsonArray::fromStringList(noti->actions())},
+        {QStringLiteral("internalId"), internalId},
+        {QStringLiteral("publicId"), publicId},
+        {QStringLiteral("appName"), noti->appName()},
+        {QStringLiteral("ticker"), noti->ticker()},
+        {QStringLiteral("title"), noti->title()},
+        {QStringLiteral("text"), noti->text()},
+        {QStringLiteral("dismissable"), noti->dismissable()},
+        {QStringLiteral("repliable"), !noti->replyId().isEmpty()},
+        {QStringLiteral("active"), true},
+        {QStringLiteral("timestamp"), static_cast<double>(QDateTime::currentMSecsSinceEpoch())},
+    };
+    m_notificationHistory.prepend(notification);
+    while (m_notificationHistory.size() > maximumNotificationHistorySize) {
+        m_notificationHistory.removeLast();
+    }
+    persistNotificationHistory();
+}
+
+void NotificationsPlugin::markNotificationHistoryInactive(const QString &internalId)
+{
+    for (qsizetype i = 0; i < m_notificationHistory.size(); ++i) {
+        QJsonObject notification = m_notificationHistory.at(i).toObject();
+        if (notification.value(QStringLiteral("internalId")).toString() != internalId) {
+            continue;
+        }
+        if (!notification.value(QStringLiteral("active")).toBool() && notification.value(QStringLiteral("publicId")).toString().isEmpty()) {
+            return;
+        }
+
+        notification.insert(QStringLiteral("active"), false);
+        notification.insert(QStringLiteral("publicId"), QString());
+        m_notificationHistory.replace(i, notification);
+        persistNotificationHistory();
+        return;
+    }
+}
+
+void NotificationsPlugin::markAllNotificationHistoryInactive()
+{
+    bool changed = false;
+    for (qsizetype i = 0; i < m_notificationHistory.size(); ++i) {
+        QJsonObject notification = m_notificationHistory.at(i).toObject();
+        if (!notification.value(QStringLiteral("active")).toBool() && notification.value(QStringLiteral("publicId")).toString().isEmpty()) {
+            continue;
+        }
+
+        notification.insert(QStringLiteral("active"), false);
+        notification.insert(QStringLiteral("publicId"), QString());
+        m_notificationHistory.replace(i, notification);
+        changed = true;
+    }
+
+    if (changed) {
+        persistNotificationHistory();
+    }
 }
 
 QString NotificationsPlugin::dbusPath() const

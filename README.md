@@ -2,6 +2,16 @@
 
 KDE Connect is a multi-platform app that allows your devices to communicate (eg: your phone and your computer).
 
+## Changes in this fork
+
+This fork improves Android notification handling on Windows while leaving notification behavior on other platforms unchanged:
+
+- Windows toast notifications expose the exact actions supplied by Android, such as YouTube's `Turn Off` and `Watch Later` or Gmail's `Archive`, `Mark as read`, and `Reply`.
+- The Windows daemon registers its toast activator so action buttons can call back into KDE Connect.
+- The main app displays the same actions in notification history.
+- The latest 100 notifications are stored as plain JSON in the existing per-device configuration and restored after restarts.
+- Actions remain visible but are disabled when their Android notification is no longer active.
+
 ## (Some) Features
 - **Shared clipboard**: copy and paste between your phone and your computer (or any other device).
 - **Notification sync**: Read and reply to your Android notifications from the desktop.

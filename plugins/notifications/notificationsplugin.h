@@ -19,13 +19,16 @@ class NotificationsPlugin : public KdeConnectPlugin
 {
     Q_OBJECT
     Q_CLASSINFO("D-Bus Interface", "org.kde.kdeconnect.device.notifications")
+    Q_PROPERTY(QString notificationHistory READ notificationHistory NOTIFY notificationHistoryChanged)
 
 public:
-    using KdeConnectPlugin::KdeConnectPlugin;
+    explicit NotificationsPlugin(QObject *parent, const QVariantList &args);
+    ~NotificationsPlugin() override;
 
     void receivePacket(const NetworkPacket &np) override;
     void connected() override;
     QString dbusPath() const override;
+    QString notificationHistory() const;
 
     void clearNotifications();
     void dismissRequested(const QString &notification);
@@ -42,6 +45,7 @@ Q_SIGNALS:
     Q_SCRIPTABLE void notificationRemoved(const QString &publicId);
     Q_SCRIPTABLE void notificationUpdated(const QString &publicId);
     Q_SCRIPTABLE void allNotificationsRemoved();
+    Q_SCRIPTABLE void notificationHistoryChanged();
 
 private:
     /**
@@ -55,8 +59,15 @@ private:
     void removeNotification(const QString &internalId);
     QString newId(); // Generates successive identifiers to use as public ids
     void notificationReady();
+    void loadNotificationHistory();
+    void persistNotificationHistory();
+    void upsertNotificationHistory(Notification *noti, const QString &publicId);
+    void markNotificationHistoryInactive(const QString &internalId);
+    void markAllNotificationHistoryInactive();
 
     QHash<QString, QPointer<Notification>> m_notifications;
     QHash<QString, QString> m_internalIdToPublicId;
+    QJsonArray m_notificationHistory;
+    QByteArray m_persistedNotificationHistory;
     int m_lastId = 0;
 };

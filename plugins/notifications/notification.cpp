@@ -113,7 +113,14 @@ void Notification::createKNotification(const NetworkPacket &np)
     // Mark this notification so sendnotifications can filter it out and not echo it back to the device
     m_notification->setHint(QStringLiteral("x-kdeconnect-source-device"), m_device->name());
 
-    if (!m_requestReplyId.isEmpty()) {
+#ifdef Q_OS_WIN
+    // SnoreToast cannot display an inline reply and regular actions together.
+    // Prefer the notification's custom actions when both are available.
+    const bool showReplyAction = m_actions.isEmpty();
+#else
+    constexpr bool showReplyAction = true;
+#endif
+    if (!m_requestReplyId.isEmpty() && showReplyAction) {
         auto replyAction = std::make_unique<KNotificationReplyAction>(i18nc("@action:button", "Reply"));
 
         if (isGroupConversation()) {
@@ -131,6 +138,12 @@ void Notification::createKNotification(const NetworkPacket &np)
     }
 
     m_notification->clearActions();
+#ifdef Q_OS_WIN
+    if (!m_requestReplyId.isEmpty() && !showReplyAction) {
+        KNotificationAction *replyAction = m_notification->addAction(i18nc("@action:button", "Reply"));
+        connect(replyAction, &KNotificationAction::activated, this, &Notification::reply);
+    }
+#endif
     for (const QString &actionId : std::as_const(m_actions)) {
         KNotificationAction *action = m_notification->addAction(actionId);
 

@@ -8,6 +8,8 @@
 #include <QCommandLineOption>
 #include <QCommandLineParser>
 #include <QDBusMessage>
+#include <QDir>
+#include <QFile>
 #include <QIcon>
 #include <QProcess>
 #include <QQuickStyle>
@@ -28,6 +30,21 @@
 
 #include "desktop_daemon.h"
 #include "kdeconnect-version.h"
+
+#ifdef Q_OS_WIN
+static void ensureToastActivatorShortcut()
+{
+    const QString shortcutName = QStringLiteral("KDE Connect/KDE Connect Notifications");
+    const QString shortcutPath = QDir(QStandardPaths::writableLocation(QStandardPaths::ApplicationsLocation)).filePath(shortcutName + QStringLiteral(".lnk"));
+    const QString snoreToast = QStandardPaths::findExecutable(QStringLiteral("SnoreToast.exe"), {QCoreApplication::applicationDirPath()});
+    if (snoreToast.isEmpty()) {
+        return;
+    }
+
+    QFile::remove(shortcutPath);
+    QProcess::execute(snoreToast, {QStringLiteral("-install"), shortcutName, QCoreApplication::applicationFilePath(), QStringLiteral("kdeconnect.daemon")});
+}
+#endif
 
 // Copied from plasma-workspace/libkworkspace/kworkspace.cpp
 static void detectPlatform(int argc, char **argv)
@@ -79,6 +96,9 @@ int main(int argc, char *argv[])
                          KAboutLicense::GPL,
                          i18n("© 2015–2025 KDE Connect Team"));
     KAboutData::setApplicationData(aboutData);
+#ifdef Q_OS_WIN
+    ensureToastActivatorShortcut();
+#endif
     app.setQuitOnLastWindowClosed(false);
 
 #if defined(Q_OS_WIN) || defined(Q_OS_MAC)

@@ -70,7 +70,10 @@ Kirigami.ScrollablePage {
                     }
 
                     ScriptAction {
-                        script: listitem.model.dbusInterface.dismiss()
+                        script: {
+                            if (listitem.model.active && listitem.model.dbusInterface)
+                                listitem.model.dbusInterface.dismiss();
+                        }
                     }
 
                 }
@@ -189,7 +192,7 @@ Kirigami.ScrollablePage {
                                     id: replyButton
 
                                     visible: listitem.model.repliable
-                                    enabled: listitem.model.repliable && !listitem.replying
+                                    enabled: listitem.model.active && listitem.model.repliable && !listitem.replying
                                     icon.name: "mail-reply-sender"
                                     icon.width: Kirigami.Units.iconSizes.smallMedium
                                     icon.height: Kirigami.Units.iconSizes.smallMedium
@@ -205,7 +208,7 @@ Kirigami.ScrollablePage {
                                     id: dismissButton
 
                                     visible: notificationsModel.isAnyDimissable
-                                    enabled: listitem.model.dismissable
+                                    enabled: listitem.model.active && listitem.model.dismissable
                                     Layout.alignment: Qt.AlignTop
                                     icon.name: "window-close"
                                     icon.width: Kirigami.Units.iconSizes.smallMedium
@@ -229,6 +232,28 @@ Kirigami.ScrollablePage {
 
                         }
 
+                    }
+
+                    Flow {
+                        visible: listitem.model.actions.length > 0
+                        spacing: Kirigami.Units.smallSpacing
+                        Layout.fillWidth: true
+                        implicitHeight: childrenRect.height
+
+                        Repeater {
+                            model: listitem.model.actions
+
+                            delegate: Button {
+                                required property string modelData
+
+                                text: modelData
+                                enabled: listitem.model.active
+                                onClicked: {
+                                    if (listitem.model.active)
+                                        page.pluginInterface.sendAction(listitem.model.notificationId, modelData);
+                                }
+                            }
+                        }
                     }
 
                     RowLayout {
@@ -281,8 +306,10 @@ Kirigami.ScrollablePage {
                             text: i18n("Send")
                             padding: replyTextField.padding
                             icon.name: LayoutMirroring.enabled ? "document-send-rtl" : "document-send"
-                            enabled: replyTextField.text !== ""
+                            enabled: listitem.model.active && replyTextField.text !== ""
                             onClicked: {
+                                if (!listitem.model.active || !listitem.model.dbusInterface)
+                                    return;
                                 listitem.model.dbusInterface.sendReply(replyTextField.text);
                                 replyTextField.text = "";
                                 listitem.replying = false;
